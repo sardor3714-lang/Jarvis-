@@ -5,6 +5,7 @@ import android.app.Activity;
 import android.content.ActivityNotFoundException;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.database.Cursor;
@@ -20,17 +21,20 @@ import android.provider.AlarmClock;
 import android.provider.ContactsContract;
 import android.provider.MediaStore;
 import android.provider.Settings;
+import android.telephony.SmsManager;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Calendar;
 import java.util.HashMap;
@@ -53,6 +57,9 @@ final class CommandEngine {
 
     interface Host {
         void say(String text);
+        /** Gapiradi va javobni eshitish uchun mikrofonni o'zi yoqadi. */
+        void ask(String text);
+        void status(String text);
         String lang();
         void stopSpeaking();
         void requestPerms(String[] perms, String retryCommand);
@@ -62,7 +69,16 @@ final class CommandEngine {
     private final Host host;
     private final ExecutorService exec = Executors.newSingleThreadExecutor();
     private final Handler main = new Handler(Looper.getMainLooper());
+    private final SharedPreferences prefs;
     private String lastCommand = "";
+
+    // Ko'p bosqichli suhbat holati (masalan, SMS: kimga -> nima deb -> tasdiq)
+    private static final int NONE = 0, SMS_TO = 1, SMS_TEXT = 2, SMS_CONFIRM = 3;
+    private int pending = NONE;
+    private String smsTo, smsNumber, smsText;
+
+    /** AI suhbat tarixi: {rol, matn}. */
+    private final List<String[]> history = new ArrayList<>();
 
     private static final String[] UZ_DAYS = {"yakshanba", "dushanba", "seshanba", "chorshanba", "payshanba", "juma", "shanba"};
     private static final String[] UZ_MONTHS = {"yanvar", "fevral", "mart", "aprel", "may", "iyun", "iyul", "avgust", "sentabr", "oktabr", "noyabr", "dekabr"};
@@ -97,6 +113,7 @@ final class CommandEngine {
     CommandEngine(Activity act, Host host) {
         this.act = act;
         this.host = host;
+        this.prefs = act.getSharedPreferences("jarvis", Context.MODE_PRIVATE);
     }
 
     void shutdown() {
@@ -118,8 +135,13 @@ final class CommandEngine {
     // ================================================================ main router
 
     void handle(String raw) {
+        handleInternal(raw, true);
+    }
+
+    private void handleInternal(String raw, boolean allowAi) {
         lastCommand = raw;
         String s = norm(raw);
+        if (pending != NONE && handlePending(raw, s)) return;
         if (s.isEmpty()) {
             say(t("Ha, Sir? Buyuring.", "Yes, Sir?"));
             return;
@@ -139,19 +161,34 @@ final class CommandEngine {
             help();
             return;
         }
-        if (has(s, "rahmat", "thank", "tashakkur")) {
+        if (w.size() <= 2 && has(s, "rahmat", "thank", "tashakkur")) {
             say(t("Arzimaydi, Sir. Doim xizmatingizdaman.", "You're welcome, Sir."));
             return;
         }
-        if (w.size() <= 4 && has(s, "salom", "assalom", "hello", "hey", "qalaysan", "how are you")) {
-            say(t("Salom, Sir! Hammasi joyida, tizimlar to'liq ishlayapti. Nima qilamiz?",
+        if (w.size() <= 2 && has(s, "salom", "assalom", "hello", "hey", "qalaysan", "how are you")) {
+            say(t("Salom, Sir! Barcha tizimlar ishlayapti. Nima qilamiz?",
                     "Hello, Sir! All systems are online. What shall we do?"));
             return;
         }
+
+        // ---- xotira
+        if (has(s, "eslab qolding", "eslab qolgan", "esingda nima", "nimalarni bilasan", "what do you remember")) { recallNotes(); return; }
+        if (has(s, "hammasini unut", "xotirani tozala", "forget everything")) { forgetNotes(); return; }
+        if (has(s, "ismim nima", "men kimman", "what's my name", "whats my name", "what is my name")) { tellName(); return; }
+        if (has(s, "mening ismim", "my name is") || s.startsWith("ismim ")) { setName(raw); return; }
+        if (has(s, "eslab qol", "yodda tut", "esingda tut", "remember that", "remember ")) { rememberNote(raw); return; }
+
+        // ---- SMS
+        if (hasWord(w, "sms", "smska") || has(s, "xabar yoz", "xabar yubor", "xabar jo'nat", "sms yoz", "message to", "text to")
+                || s.matches(".*\\S+(?:ga|ka|qa) .* deb xabar.*")) {
+            smsStart(raw);
+            return;
+        }
+
         if (has(s, "budilnik", "uyg'ot", "alarm")) { alarm(s); return; }
         if (has(s, "taymer", "timer")) { timer(s); return; }
         if (has(s, "soat nech", "soat qancha", "vaqt qancha", "hozir vaqt", "what time", "the time")) { time(); return; }
-        if (has(s, "bugun nechan", "sana", "qaysi kun", "bugun qaysi", "what day", "the date", "today's date")) { date(); return; }
+        if (has(s, "bugun nechan", "qaysi sana", "bugungi sana", "sana nechi", "bugun qaysi", "what day", "the date", "today's date")) { date(); return; }
         if (has(s, "batareya", "zaryad", "battery")) { battery(); return; }
         if (has(s, "fonar", "chiroq", "flashlight", "torch")) {
             flashlight(!has(s, "o'chir", "off", "o'chi"));
@@ -164,23 +201,24 @@ final class CommandEngine {
         }
         if (has(s, "mobil internet", "internetni yoq", "internetni o'chir", "mobile data", "mobil ma'lumot", "internetni och")) { internetPanel(); return; }
         if (has(s, "ovozni", "tovush", "volume", "ovoz baland", "ovoz past")) { volume(s); return; }
-        if (has(s, "qo'ng'iroq", "qong'iroq", "telefon qil", "call ", "zvonit", "qo'ng'iroq qil")) { call(s); return; }
+        if (has(s, "qo'ng'iroq", "qong'iroq", "telefon qil", "call ", "zvonit")) { call(s); return; }
         if (has(s, "ob-havo", "ob havo", "obhavo", "havo qanday", "weather")) { weather(w); return; }
         if (has(s, "youtube", "yutub", "yutyub", "youtub")) { youtube(s); return; }
         if (has(s, "yo'l ko'rsat", "qanday boraman", "xaritada", "navigate", "directions to", "show on map")) { maps(s); return; }
-        if (hasWord(w, "qidir", "qidirib", "izla", "izlab", "google", "googlda", "search")) { search(stripWords(s,
-                "qidir", "qidirib", "izla", "izlab", "ber", "google", "googleda", "googlda", "internetdan", "search", "for", "on", "da", "menga")); return; }
-        if (s.matches(".*\\d.*") && tryMath(s)) return;
-        if (hasWord(w, "och", "ochib", "ochgin", "oching", "ochchi", "open", "launch") || has(s, "ishga tushir")) { openApp(s); return; }
-        if (hasWord(w, "nima", "kim", "haqida", "nimadir", "kimdir", "qayerda")
-                || s.startsWith("what is") || s.startsWith("who is") || s.startsWith("who was")
-                || s.startsWith("what are") || s.startsWith("tell me about")) {
-            knowledge(s);
+        if (hasWord(w, "qidir", "qidirib", "izla", "izlab", "google", "googleda", "google'da", "googlda", "search")) {
+            search(stripWords(s, "qidir", "qidirib", "izla", "izlab", "ber", "google", "googleda", "google'da", "googlda", "internetdan",
+                    "search", "for", "on", "da", "menga"));
             return;
         }
-        // Tushunmagan bo'lsa: avval Vikipediya, so'ng Google
-        say(t("Bu buyruqni aniq tushunmadim, Sir. Internetdan izlab ko'raman.", "I'm not sure what you mean, Sir. Let me look it up."));
-        knowledge(s);
+        if (s.matches(".*\\d.*") && tryMath(s)) return;
+        if (hasWord(w, "och", "ochib", "ochgin", "oching", "ochchi", "open", "launch") || has(s, "ishga tushir")) { openApp(s); return; }
+        if (has(s, "vikipediya", "wikipedia", "vikipediyadan")) { knowledge(s); return; }
+
+        if (allowAi) {
+            askAi(raw);
+        } else {
+            say(t("Buni bajarishni hali bilmayman, Sir.", "I don't know how to do that yet, Sir."));
+        }
     }
 
     // ================================================================ text helpers
@@ -246,13 +284,13 @@ final class CommandEngine {
     // ================================================================ commands
 
     private void help() {
-        say(t("Men quyidagilarni qila olaman, Sir: ilovalarni ochish (Telegramni och), fonarni yoqish, "
-                        + "soat va sanani aytish, budilnik va taymer qo'yish, qo'ng'iroq qilish (Aliga qo'ng'iroq qil), "
-                        + "ob-havo (Samarqandda ob-havo qanday), Vikipediyadan ma'lumot (Ibn Sino kim), "
-                        + "Google va YouTube'da qidirish, hisob-kitob (25 ko'paytir 4), ovoz balandligi, Wi-Fi va Bluetooth sozlamalari.",
-                "I can open apps, toggle the flashlight, tell time and date, set alarms and timers, call contacts, "
-                        + "check the weather, look things up on Wikipedia, search Google and YouTube, do math, change volume, "
-                        + "and open Wi-Fi or Bluetooth settings, Sir."));
+        say(t("Men quyidagilarni qila olaman, Sir: ilovalarni ochish, fonar, soat va sana, budilnik va taymer, "
+                        + "qo'ng'iroq va SMS (Aliga sms yoz salom), ob-havo, Google va YouTube'da qidirish, hisob-kitob, "
+                        + "ovoz balandligi, Wi-Fi va Bluetooth. Narsalarni eslab qolaman (eslab qol, ...). "
+                        + "Va istalgan mavzuda erkin suhbatlasha olaman. Shunchaki oddiy tilda gapiring.",
+                "I can open apps, toggle the flashlight, tell time and date, set alarms and timers, call and text people, "
+                        + "check the weather, search Google and YouTube, do math, change volume, remember things, "
+                        + "and chat freely about anything, Sir. Just talk to me naturally."));
     }
 
     private void time() {
@@ -462,7 +500,7 @@ final class CommandEngine {
     }
 
     private void youtube(String s) {
-        String q = stripWords(s, "youtube", "youtubeda", "youtubedan", "youtubeni", "yutub", "yutubda", "yutubdan", "yutyub",
+        String q = stripWords(s, "youtube", "youtube'da", "youtube'dan", "youtube'ni", "youtubeda", "youtubedan", "youtubeni", "yutub", "yutubda", "yutubdan", "yutyub",
                 "youtub", "youtubda", "och", "ochib", "ber", "qo'y", "qo'yib", "ko'rsat", "top", "izla", "qidir", "play", "on", "open", "search", "for");
         if (q.isEmpty()) {
             launchByName("youtube");
@@ -638,6 +676,378 @@ final class CommandEngine {
         String out = sb.toString();
         if (out.length() > maxLen) out = out.substring(0, maxLen).trim() + "...";
         return out;
+    }
+
+    // ---------------------------------------------------------------- multi-step dialog
+
+    private static String lightNorm(String raw) {
+        return raw.trim()
+                .replaceAll("[ʻʼ’‘`´]", "'")
+                .replaceFirst("(?i)^(hey |salom )?jarvis[,!.]?\\s*", "")
+                .trim();
+    }
+
+    private boolean handlePending(String raw, String s) {
+        List<String> w = Arrays.asList(s.split(" "));
+        boolean cancel = hasWord(w, "bekor", "cancel") || has(s, "kerak emas", "bekor qil", "to'xta")
+                || (pending != SMS_TEXT && hasWord(w, "yo'q", "no", "yoq", "nope"));
+        if (cancel) {
+            pending = NONE;
+            say(t("Bekor qilindi, Sir.", "Cancelled, Sir."));
+            return true;
+        }
+        switch (pending) {
+            case SMS_TO: {
+                pending = NONE;
+                String who = stripSuffix(stripWords(s, "unga", "to", "for"), "ga", "ka", "qa");
+                smsResolve(who, smsText);
+                return true;
+            }
+            case SMS_TEXT: {
+                String text = lightNorm(raw);
+                if (text.isEmpty()) {
+                    host.ask(t("Nima deb yozay, Sir?", "What should I write, Sir?"));
+                    return true;
+                }
+                smsText = text;
+                pending = SMS_CONFIRM;
+                askConfirm();
+                return true;
+            }
+            case SMS_CONFIRM: {
+                if (hasWord(w, "ha", "xa", "yubor", "jo'nat", "albatta", "mayli", "ok", "okey", "yes", "send", "xop", "hop", "bo'pti", "yep")
+                        || has(s, "ha yubor", "yuboraver")) {
+                    smsSend();
+                } else {
+                    host.ask(t("Yuboraymi, Sir? Ha yoki yo'q deng.", "Shall I send it, Sir? Say yes or no."));
+                }
+                return true;
+            }
+            default:
+                pending = NONE;
+                return false;
+        }
+    }
+
+    // ---------------------------------------------------------------- SMS
+
+    private void smsStart(String raw) {
+        String light = lightNorm(raw);
+        String name = null;
+        String text = null;
+        String nameRe = "((?:\\S+ )*?\\S+?)(?:ga|ka|qa)";
+        int ci = Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE;
+        Matcher m;
+        if ((m = Pattern.compile("^" + nameRe + " (.+?) (?:deb|degan) (?:sms|xabar)\\S*.*$", ci).matcher(light)).matches()) {
+            name = m.group(1);
+            text = m.group(2);
+        } else if ((m = Pattern.compile("^" + nameRe + " (?:sms|xabar)\\S*(?: (?:yoz|yubor|jo'nat)\\S*){0,2}(?: (?:ber|bering|qil|qiling))?(?: (.+))?$", ci).matcher(light)).matches()) {
+            name = m.group(1);
+            text = m.group(2);
+        } else if ((m = Pattern.compile("^(?:sms|xabar)\\S*(?: (?:yoz|yubor|jo'nat)\\S*){0,2}(?: (?:ber|bering))? " + nameRe + "(?: (.+))?$", ci).matcher(light)).matches()) {
+            name = m.group(1);
+            text = m.group(2);
+        } else if ((m = Pattern.compile("^(?:please )?(?:send |write )?(?:an? )?(?:sms|text|message)(?: message)? to (\\S+)(?: (.+))?$", ci).matcher(light)).matches()) {
+            name = m.group(1);
+            text = m.group(2);
+        }
+        if (text != null) {
+            text = text.replaceFirst("(?i)^(?:deb|that|saying)\\s+", "").trim();
+            if (text.isEmpty()) text = null;
+        }
+        smsText = text;
+        if (name == null || name.trim().isEmpty()) {
+            pending = SMS_TO;
+            host.ask(t("Kimga yozay, Sir?", "Who should I text, Sir?"));
+            return;
+        }
+        smsResolve(name.trim().toLowerCase(Locale.ROOT), text);
+    }
+
+    private void smsResolve(String who, String text) {
+        if (who.isEmpty()) {
+            pending = SMS_TO;
+            host.ask(t("Kimga yozay, Sir?", "Who should I text, Sir?"));
+            return;
+        }
+        String digits = who.replaceAll("[^0-9+]", "");
+        if (digits.replace("+", "").length() >= 5) {
+            smsNumber = digits;
+            smsTo = digits;
+        } else {
+            if (act.checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) {
+                pending = NONE;
+                say(t("Kontaktlarni o'qishga ruxsat bering, Sir, keyin davom etaman.", "Please allow contacts access, Sir."));
+                String retry = who + "ga sms yoz" + (text != null ? " " + text : "");
+                host.requestPerms(new String[]{Manifest.permission.READ_CONTACTS, Manifest.permission.SEND_SMS}, retry);
+                return;
+            }
+            String[] found = findContact(who);
+            if (found == null) {
+                pending = NONE;
+                say(t("Kontaktlarda \"" + who + "\" topilmadi, Sir.", "I couldn't find \"" + who + "\" in contacts, Sir."));
+                return;
+            }
+            smsTo = found[0];
+            smsNumber = found[1];
+        }
+        smsText = text;
+        if (text == null) {
+            pending = SMS_TEXT;
+            host.ask(t(smsTo + "ga nima deb yozay, Sir?", "What should I say to " + smsTo + ", Sir?"));
+        } else {
+            pending = SMS_CONFIRM;
+            askConfirm();
+        }
+    }
+
+    private void askConfirm() {
+        host.ask(t(smsTo + "ga: \"" + smsText + "\". Yuboraymi, Sir?",
+                "To " + smsTo + ": \"" + smsText + "\". Shall I send it, Sir?"));
+    }
+
+    @SuppressWarnings("deprecation")
+    private void smsSend() {
+        if (act.checkSelfPermission(Manifest.permission.SEND_SMS) != PackageManager.PERMISSION_GRANTED) {
+            say(t("SMS yuborishga ruxsat bering, Sir.", "Please allow sending SMS, Sir."));
+            host.requestPerms(new String[]{Manifest.permission.SEND_SMS}, "ha");
+            return;
+        }
+        pending = NONE;
+        try {
+            SmsManager sm = Build.VERSION.SDK_INT >= 31 ? act.getSystemService(SmsManager.class) : SmsManager.getDefault();
+            ArrayList<String> parts = sm.divideMessage(smsText);
+            if (parts.size() > 1) sm.sendMultipartTextMessage(smsNumber, null, parts, null, null);
+            else sm.sendTextMessage(smsNumber, null, smsText, null, null);
+            say(t("Xabar " + smsTo + "ga yuborildi, Sir.", "Message sent to " + smsTo + ", Sir."));
+        } catch (Exception e) {
+            say(t("SMS yuborib bo'lmadi, Sir. SIM karta va balansni tekshiring.", "Couldn't send the SMS, Sir. Check your SIM card."));
+        }
+    }
+
+    // ---------------------------------------------------------------- memory
+
+    private List<String> loadNotes() {
+        List<String> out = new ArrayList<>();
+        try {
+            JSONArray arr = new JSONArray(prefs.getString("notes", "[]"));
+            for (int i = 0; i < arr.length(); i++) out.add(arr.getString(i));
+        } catch (Exception ignored) {
+        }
+        return out;
+    }
+
+    private void saveNotes(List<String> notes) {
+        JSONArray arr = new JSONArray();
+        for (String n : notes) arr.put(n);
+        prefs.edit().putString("notes", arr.toString()).apply();
+    }
+
+    private void rememberNote(String raw) {
+        String note = lightNorm(raw)
+                .replaceAll("(?i)\\b(eslab qol(gin|ing)?|yodda tut(gin|ing)?|esingda tut(gin|ing)?|remember( that)?)\\b[:,]?", " ")
+                .replaceAll("\\s+", " ")
+                .replaceAll("^[\\s,.:]+|[\\s,.:]+$", "")
+                .trim();
+        if (note.isEmpty()) {
+            say(t("Nimani eslab qolay, Sir?", "What should I remember, Sir?"));
+            return;
+        }
+        List<String> notes = loadNotes();
+        notes.add(note);
+        while (notes.size() > 30) notes.remove(0);
+        saveNotes(notes);
+        say(t("Eslab qoldim, Sir: " + note, "Got it, Sir. I'll remember: " + note));
+    }
+
+    private void recallNotes() {
+        List<String> notes = loadNotes();
+        String name = prefs.getString("user_name", "");
+        if (notes.isEmpty() && name.isEmpty()) {
+            say(t("Hozircha hech narsa eslab qolmadim, Sir. \"Eslab qol, ...\" deb ayting.", "Nothing saved yet, Sir."));
+            return;
+        }
+        StringBuilder sb = new StringBuilder(t("Eslab qolganlarim, Sir: ", "Here's what I remember, Sir: "));
+        if (!name.isEmpty()) sb.append(t("ismingiz " + name + ". ", "your name is " + name + ". "));
+        for (int i = 0; i < notes.size(); i++) sb.append(i + 1).append(") ").append(notes.get(i)).append(". ");
+        say(sb.toString().trim());
+    }
+
+    private void forgetNotes() {
+        prefs.edit().remove("notes").remove("user_name").apply();
+        history.clear();
+        say(t("Xotiram tozalandi, Sir.", "Memory cleared, Sir."));
+    }
+
+    private void setName(String raw) {
+        Matcher m = Pattern.compile("(?i)(?:mening ismim|ismim|my name is)\\s+(\\S+)").matcher(lightNorm(raw));
+        if (!m.find()) {
+            say(t("Ismingizni tushunmadim, Sir.", "I didn't catch your name, Sir."));
+            return;
+        }
+        String name = capitalize(m.group(1).replaceAll("[^\\p{L}'-]", ""));
+        prefs.edit().putString("user_name", name).apply();
+        say(t("Tanishganimdan xursandman, " + name + ". Lekin men sizni baribir Sir deb chaqiraman.",
+                "Nice to meet you, " + name + ". I'll still call you Sir."));
+    }
+
+    private void tellName() {
+        String name = prefs.getString("user_name", "");
+        say(name.isEmpty()
+                ? t("Hali ismingizni aytmagansiz, Sir. \"Mening ismim ...\" deb ayting.", "You haven't told me your name yet, Sir.")
+                : t("Sizning ismingiz " + name + ", Sir.", "Your name is " + name + ", Sir."));
+    }
+
+    // ---------------------------------------------------------------- AI (kalitsiz)
+
+    private String systemPrompt() {
+        String now = new SimpleDateFormat("yyyy-MM-dd HH:mm, EEEE", Locale.US).format(Calendar.getInstance().getTime());
+        String name = prefs.getString("user_name", "");
+        List<String> notes = loadNotes();
+        StringBuilder sb = new StringBuilder();
+        if (uz()) {
+            sb.append("Sen J.A.R.V.I.S. — foydalanuvchining Android telefonidagi aqlli shaxsiy ovozli yordamchisisan. ")
+              .append("Foydalanuvchini doim \"Sir\" deb chaqir. Xushmuomala, aqlli, biroz hazilkash bo'l, xuddi Temir odamning Jarvisi kabi. ")
+              .append("Javoblaring qisqa bo'lsin (1-3 gap), chunki ular ovoz bilan o'qiladi. Markdown, ro'yxat, emoji ishlatma. ")
+              .append("Faqat o'zbek tilida, lotin yozuvida javob ber. Bilmasang, to'qib chiqarma, bilmasligingni ayt. ")
+              .append("Hozirgi vaqt: ").append(now).append(". ")
+              .append("MUHIM: agar foydalanuvchi telefonda amal bajarishni so'rasa, boshqa hech narsa yozmasdan faqat bitta qator qaytar: ")
+              .append("CMD: <buyruq>. Mavjud buyruqlar: <ilova>ni och; fonarni yoq; fonarni o'chir; soat nechi; bugun nechanchi sana; ")
+              .append("soat HH:MM da budilnik qo'y; N daqiqaga taymer qo'y; <ism>ga qo'ng'iroq qil; <ism>ga sms yoz <matn>; ")
+              .append("<shahar>da ob-havo; google'da qidir <so'z>; youtube'da <so'z> qo'y; <joy>ga yo'l ko'rsat; ")
+              .append("ovozni balandlat; ovozni pasaytir; ovozni o'chir; wifi; bluetooth; batareya; eslab qol <matn>. ")
+              .append("Masalan: \"menga biror musiqa qo'yib ber\" -> CMD: youtube'da musiqa qo'y. ")
+              .append("Agar so'rov bu ro'yxatda bo'lmagan amal bo'lsa, uni qila olmasligingni qisqa ayt. Oddiy savol yoki suhbatga oddiy javob ber.");
+            if (!name.isEmpty()) sb.append(" Foydalanuvchining ismi: ").append(name).append(".");
+            if (!notes.isEmpty()) sb.append(" Foydalanuvchi eslab qolishni so'ragan narsalar: ").append(String.join("; ", notes)).append(".");
+        } else {
+            sb.append("You are J.A.R.V.I.S., the user's smart personal voice assistant on their Android phone. ")
+              .append("Always address the user as \"Sir\". Be polite, clever and a little witty, like Iron Man's Jarvis. ")
+              .append("Keep answers short (1-3 sentences) because they are spoken aloud. No markdown, lists or emoji. ")
+              .append("If you don't know, say so; never make things up. Current time: ").append(now).append(". ")
+              .append("IMPORTANT: if the user asks for a phone action, reply with exactly one line and nothing else: CMD: <command>. ")
+              .append("Available commands: open <app>; flashlight on; flashlight off; what time is it; what's the date; ")
+              .append("set an alarm for HH:MM; timer for N minutes; call <name>; send sms to <name> <text>; weather in <city>; ")
+              .append("search google for <words>; play <words> on youtube; navigate to <place>; volume up; volume down; mute; ")
+              .append("wifi; bluetooth; battery; remember <text>. Otherwise just answer normally.");
+            if (!name.isEmpty()) sb.append(" The user's name: ").append(name).append(".");
+            if (!notes.isEmpty()) sb.append(" Things the user asked you to remember: ").append(String.join("; ", notes)).append(".");
+        }
+        return sb.toString();
+    }
+
+    private void askAi(String raw) {
+        final String userText = lightNorm(raw);
+        host.status(t("O'ylayapman...", "Thinking..."));
+        exec.execute(() -> {
+            String reply = aiChat(userText);
+            if (reply == null) {
+                String wiki = wikiSummary(uz() ? "uz" : "en", stripWords(norm(userText), "nima", "kim", "haqida", "menga",
+                        "aytib", "ber", "gapirib", "what", "is", "who", "tell", "me", "about", "the"));
+                if (wiki != null) {
+                    say(wiki);
+                } else {
+                    say(t("Aql serveriga ulana olmadim, Sir. Google'da qidiryapman.", "I couldn't reach my AI server, Sir. Searching Google."));
+                    search(userText);
+                }
+                return;
+            }
+            int idx = reply.toUpperCase(Locale.ROOT).indexOf("CMD:");
+            if (idx >= 0) {
+                String cmd = reply.substring(idx + 4).split("\n")[0].replace("\"", "").trim();
+                if (!cmd.isEmpty()) {
+                    main.post(() -> handleInternal(cmd, false));
+                    return;
+                }
+            }
+            String clean = reply.replaceAll("[*#`_]", "").replaceFirst("(?i)^jarvis:\\s*", "").replaceAll("\\n{2,}", "\n").trim();
+            addHistory("user", userText);
+            addHistory("assistant", clean);
+            host.ask(clean);
+        });
+    }
+
+    private void addHistory(String role, String text) {
+        history.add(new String[]{role, text.length() > 600 ? text.substring(0, 600) : text});
+        while (history.size() > 8) history.remove(0);
+    }
+
+    /** Avval LLM7, keyin Pollinations. Ikkalasi ham API kalit talab qilmaydi. */
+    private String aiChat(String userText) {
+        String system = systemPrompt();
+        try {
+            JSONArray msgs = new JSONArray();
+            msgs.put(new JSONObject().put("role", "system").put("content", system));
+            for (String[] h : history) msgs.put(new JSONObject().put("role", h[0]).put("content", h[1]));
+            msgs.put(new JSONObject().put("role", "user").put("content", userText));
+            for (String model : new String[]{"gpt-4.1-nano-2025-04-14", "gpt-4o-mini"}) {
+                try {
+                    JSONObject body = new JSONObject().put("model", model).put("messages", msgs)
+                            .put("temperature", 0.6).put("max_tokens", 400);
+                    String resp = httpPostJson("https://api.llm7.io/v1/chat/completions", body.toString(), "Bearer unused");
+                    String content = new JSONObject(resp).getJSONArray("choices").getJSONObject(0)
+                            .getJSONObject("message").optString("content", "").trim();
+                    if (!content.isEmpty()) return content;
+                } catch (HttpException e) {
+                    if (e.code == 429 || e.code >= 500) break;
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        try {
+            StringBuilder p = new StringBuilder();
+            int from = Math.max(0, history.size() - 4);
+            for (int i = from; i < history.size(); i++) {
+                String[] h = history.get(i);
+                String txt = h[1].length() > 300 ? h[1].substring(0, 300) : h[1];
+                p.append(h[0].equals("user") ? "User: " : "Jarvis: ").append(txt).append('\n');
+            }
+            p.append("User: ").append(userText).append("\nJarvis:");
+            String url = "https://text.pollinations.ai/" + enc(p.toString()) + "?system=" + enc(system);
+            String content = httpGet(url).trim();
+            if (!content.isEmpty() && !content.startsWith("{") && !content.startsWith("<")) return content;
+        } catch (Exception ignored) {
+        }
+        return null;
+    }
+
+    private static String enc(String s) throws Exception {
+        return URLEncoder.encode(s, "UTF-8").replace("+", "%20");
+    }
+
+    static final class HttpException extends Exception {
+        final int code;
+
+        HttpException(int code) {
+            super("HTTP " + code);
+            this.code = code;
+        }
+    }
+
+    private static String httpPostJson(String url, String body, String auth) throws Exception {
+        HttpURLConnection con = (HttpURLConnection) new URL(url).openConnection();
+        con.setRequestMethod("POST");
+        con.setDoOutput(true);
+        con.setConnectTimeout(10000);
+        con.setReadTimeout(30000);
+        con.setRequestProperty("Content-Type", "application/json");
+        con.setRequestProperty("Authorization", auth);
+        con.setRequestProperty("User-Agent", "JarvisAndroid/2.0");
+        try {
+            try (OutputStream os = con.getOutputStream()) {
+                os.write(body.getBytes(StandardCharsets.UTF_8));
+            }
+            int code = con.getResponseCode();
+            if (code >= 400) throw new HttpException(code);
+            StringBuilder sb = new StringBuilder();
+            try (BufferedReader r = new BufferedReader(new InputStreamReader(con.getInputStream(), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = r.readLine()) != null) sb.append(line).append('\n');
+            }
+            return sb.toString();
+        } finally {
+            con.disconnect();
+        }
     }
 
     // ---------------------------------------------------------------- network

@@ -19,6 +19,7 @@ import android.speech.RecognitionListener;
 import android.speech.RecognizerIntent;
 import android.speech.SpeechRecognizer;
 import android.speech.tts.TextToSpeech;
+import android.speech.tts.UtteranceProgressListener;
 import android.view.Gravity;
 import android.view.View;
 import android.view.inputmethod.EditorInfo;
@@ -52,6 +53,8 @@ public class MainActivity extends Activity implements CommandEngine.Host {
     private String pendingSpeech;
     private boolean listening = false;
     private String pendingCommand;
+    private volatile boolean listenAfterSpeech = false;
+    private boolean lastInputVoice = false;
 
     private TextView logView;
     private TextView statusView;
@@ -228,6 +231,7 @@ public class MainActivity extends Activity implements CommandEngine.Host {
         String text = input.getText().toString().trim();
         if (text.isEmpty()) return;
         input.setText("");
+        lastInputVoice = false;
         handleCommand(text);
     }
 
@@ -270,8 +274,26 @@ public class MainActivity extends Activity implements CommandEngine.Host {
     }
 
     @Override
+    public void ask(String text) {
+        runOnUiThread(() -> {
+            listenAfterSpeech = lastInputVoice;
+            say(text);
+            if (!ttsReady && lastInputVoice) {
+                listenAfterSpeech = false;
+                micButton.postDelayed(this::startListening, 1200);
+            }
+        });
+    }
+
+    @Override
+    public void status(String text) {
+        runOnUiThread(() -> statusView.setText(text));
+    }
+
+    @Override
     public void stopSpeaking() {
         runOnUiThread(() -> {
+            listenAfterSpeech = false;
             if (tts != null) tts.stop();
         });
     }
@@ -291,6 +313,16 @@ public class MainActivity extends Activity implements CommandEngine.Host {
             if (status == TextToSpeech.SUCCESS) {
                 ttsReady = true;
                 applyTtsLanguage();
+                tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
+                    @Override public void onStart(String utteranceId) { }
+                    @Override public void onDone(String utteranceId) {
+                        if (listenAfterSpeech) {
+                            listenAfterSpeech = false;
+                            runOnUiThread(() -> micButton.postDelayed(MainActivity.this::startListening, 250));
+                        }
+                    }
+                    @Override public void onError(String utteranceId) { }
+                });
                 if (pendingSpeech != null) {
                     speak(pendingSpeech);
                     pendingSpeech = null;
@@ -357,7 +389,10 @@ public class MainActivity extends Activity implements CommandEngine.Host {
         @Override public void onResults(Bundle results) {
             setListening(false);
             ArrayList<String> list = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
-            if (list != null && !list.isEmpty()) handleCommand(list.get(0));
+            if (list != null && !list.isEmpty()) {
+                lastInputVoice = true;
+                handleCommand(list.get(0));
+            }
         }
         @Override public void onPartialResults(Bundle partialResults) {
             ArrayList<String> list = partialResults.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
@@ -376,6 +411,7 @@ public class MainActivity extends Activity implements CommandEngine.Host {
                     "No speech recognition service found. Please install or update the Google app, Sir."));
             return;
         }
+        listenAfterSpeech = false;
         if (tts != null) tts.stop();
         if (recognizer == null) {
             recognizer = SpeechRecognizer.createSpeechRecognizer(this);

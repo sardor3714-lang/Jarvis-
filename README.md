@@ -20,9 +20,22 @@ API kalitsiz ishlaydi. Ovozni telefonning o'zidagi Google xizmati taniydi, javob
 | Ovozni balandlat / pasaytir / o'chir | Ovoz balandligi |
 | Wi-Fi / Bluetooth / mobil internet | Tegishli panelni ochadi |
 | Batareya necha foiz? | Zaryad darajasi |
+| Aliga sms yoz salom qalaysan | SMS yuboradi (avval tasdiq so'raydi) |
+| Onamga SMS yoz | Kimga va nima deb yozishni o'zi so'rab oladi |
+| Eslab qol, ertaga imtihon bor | Eslab qoladi, keyin suhbatda hisobga oladi |
+| Nimalarni eslab qolding? | Eslab qolganlarini aytadi |
+| Mening ismim ... | Ismingizni eslab qoladi |
+| Istalgan savol yoki gap | AI bilan erkin suhbat |
 | Nima qila olasan? | Buyruqlar ro'yxati |
 
-Tushunmagan buyruqni avval Vikipediyadan, topilmasa Google'dan qidiradi.
+## Aql (v2)
+Oddiy buyruqlarni Jarvis telefonning o'zida tushunadi. Qolgan hamma gap kalitsiz, bepul AI xizmatlariga yuboriladi: avval LLM7, u ishlamasa Pollinations. AI ikki ish qiladi:
+- erkin suhbatlashadi va savollarga javob beradi;
+- erkin aytilgan gapni Jarvis buyrug'iga aylantiradi. Masalan, "menga biror qo'shiq qo'yib ber" desangiz, YouTube'da musiqa ochadi.
+
+Jarvis savol bersa yoki AI javob bersa, gapirib bo'lgach mikrofonni o'zi yoqadi, shuning uchun suhbat uzilmaydi. Agar AI serverlari javob bermasa, Jarvis Vikipediya va Google'dan izlaydi.
+
+**Maxfiylik:** erkin suhbatdagi gaplaringiz va eslab qolgan narsalaringiz shu bepul AI xizmatlariga yuboriladi. Parol, karta raqami kabi maxfiy ma'lumotlarni aytmang.
 
 ## Jarvisni tez chaqirish
 
